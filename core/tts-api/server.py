@@ -15,6 +15,16 @@ import httpx
 from tts_engine.codec import SNACCodec
 from tts_engine.voice_config import get_voice, get_all_voices
 from tts_engine.mapper import SvaraMapper
+from tts_engine.constants import (
+    BOS_TOKEN_STR,
+    START_OF_HUMAN_STR,
+    END_OF_HUMAN_STR,
+    START_OF_AI_STR,
+    END_OF_AI_STR,
+    START_OF_SPEECH_STR,
+    AUDIO_TOKEN_STR,
+    END_OF_TURN_STR
+)
 
 # Configure logging
 logging.basicConfig(
@@ -79,7 +89,7 @@ app = FastAPI(
 # Request/Response Models
 class TTSRequest(BaseModel):
     text: str = Field(..., description="Text to convert to speech", min_length=1, max_length=1000)
-    voice_id: str = Field(default="en-US-male-1", description="Voice ID to use")
+    voice_id: str = Field(default="en_male", description="Voice ID to use", alias="voice")
     speed: float = Field(default=1.0, ge=0.5, le=2.0, description="Speech speed multiplier")
     format: str = Field(default="wav", description="Audio format (wav, mp3, pcm)")
 
@@ -188,15 +198,21 @@ def format_tts_prompt(text: str, voice: Any) -> str:
     """
     Format text into VLLM prompt following Svara-TTS format
     """
-    lang = voice.languages[0] if voice.languages else "en"
-    # Based on official repo's prompt format
-    prompt = f"""<|im_start|>system
-You are a text-to-speech system. Generate natural speech for the given text.<|im_end|>
-<|im_start|>user
-Voice: {voice.name} ({lang})
-Text: {text}<|im_end|>
-<|im_start|>assistant
-<|audio|>"""
+    # Construct speaker ID (e.g., "Hindi (Male)")
+    speaker_id = voice.name
+    
+    # Construct prompt using the specific token sequence expected by the model
+    # Format: BOS + <human_turn> + <ai_start>
+    # <human_turn>: START_HUMAN + AUDIO_TOKEN + "Speaker: Text" + END_HUMAN + END_TURN
+    # <ai_start>: START_AI + START_SPEECH
+    
+    prompt = (
+        f"{BOS_TOKEN_STR}"
+        f"{START_OF_HUMAN_STR}{AUDIO_TOKEN_STR}"
+        f"{speaker_id}: {text}"
+        f"{END_OF_HUMAN_STR}{END_OF_TURN_STR}"
+        f"{START_OF_AI_STR}{START_OF_SPEECH_STR}"
+    )
     
     return prompt
 
