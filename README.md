@@ -1,6 +1,6 @@
 # Intel® AI for Enterprise Inference
 
-Unleash the power of AI Inference on Intel Silicon
+Unleash the power of AI Inference on Intel 
 
 The Intel® AI for Enterprise Inference is aimed to streamline and enhance the deployment and management of AI inference services on Intel hardware. Utilizing the power of Kubernetes Orchestration, this solution automates the deployment of LLM models to run faster inference, provision compute resources, and configure the optimal settings to minimize the complexities and reduce manual efforts.
 
