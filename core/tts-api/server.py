@@ -1,12 +1,14 @@
 """
 FastAPI TTS Server - Integrates VLLM + SNAC for Text-to-Speech
+Streaming implementation based on Kenpath/svara-tts-inference
 """
 import asyncio
-import io
+import concurrent.futures
 import os
 import sys
 import time
-from typing import Optional, List
+from typing import Optional, List, AsyncIterator
+import logging
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
@@ -15,12 +17,19 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 # Add tts_engine to path
-sys.path.insert(0, '/home/ubuntu')
+sys.path.insert(0, '/app')
 from tts_engine.codec import SNACCodec
-from tts_engine.constants import SAMPLE_RATE, BIT_DEPTH, AUDIO_TOKEN_OFFSETS
+from tts_engine.constants import SAMPLE_RATE, BIT_DEPTH
+from tts_engine.mapper import SvaraMapper, extract_custom_token_numbers
+from tts_engine.transports import VLLMCompletionsTransportAsync
+from tts_engine.buffers import AudioBuffer
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration
-VLLM_URL = os.getenv("VLLM_URL", "http://10.233.104.79:2080")
+VLLM_BASE_URL = os.getenv("VLLM_URL", "http://10.233.104.79:2080")
 VLLM_MODEL = "kenpath/svara-tts-v1"
 API_PORT = int(os.getenv("API_PORT", "8000"))
 
@@ -31,14 +40,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Global SNAC codec instance (initialized on startup)
+# Global instances
 snac_codec = None
+vllm_transport = None
 
 
 # Request/Response Models
 class TTSRequest(BaseModel):
     text: str = Field(..., description="Text to convert to speech", min_length=1, max_length=500)
-    voice: str = Field(default="en-US-male", description="Voice ID to use")
+    voice: str = Field(default="English (Male)", description="Voice ID to use (e.g., 'English (Male)', 'Hindi (Female)')")
     speed: float = Field(default=1.0, description="Speech speed multiplier", ge=0.5, le=2.0)
     
 class VoiceInfo(BaseModel):
@@ -57,37 +67,48 @@ class HealthResponse(BaseModel):
 # Startup/Shutdown Events
 @app.on_event("startup")
 async def startup_event():
-    """Initialize SNAC codec on startup"""
-    global snac_codec
-    print("🚀 Starting TTS API Server...")
-    print(f"📍 VLLM URL: {VLLM_URL}")
-    print(f"🎤 Loading SNAC codec...")
+    """Initialize SNAC codec and VLLM transport on startup"""
+    global snac_codec, vllm_transport
+    logger.info("🚀 Starting TTS API Server...")
+    logger.info(f"📍 VLLM URL: {VLLM_BASE_URL}")
+    logger.info(f"🎤 Loading SNAC codec...")
     
     try:
         snac_codec = SNACCodec(device='cpu')
-        print(f"✅ SNAC codec loaded successfully")
+        logger.info(f"✅ SNAC codec loaded successfully")
     except Exception as e:
-        print(f"❌ Failed to load SNAC: {e}")
+        logger.error(f"❌ Failed to load SNAC: {e}")
+        raise
+    
+    # Initialize VLLM transport
+    try:
+        # Ensure URL ends with /v1 for completions endpoint
+        base_url = VLLM_BASE_URL.rstrip('/').removesuffix('/v1') + '/v1'
+        vllm_transport = VLLMCompletionsTransportAsync(base_url, VLLM_MODEL)
+        logger.info(f"✅ VLLM transport initialized")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize VLLM transport: {e}")
         raise
     
     # Test VLLM connection
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{VLLM_URL}/health")
+            health_url = VLLM_BASE_URL.rstrip('/').removesuffix('/v1') + '/health'
+            response = await client.get(health_url)
             if response.status_code == 200:
-                print(f"✅ VLLM connection verified")
+                logger.info(f"✅ VLLM connection verified")
             else:
-                print(f"⚠️ VLLM returned status {response.status_code}")
+                logger.warning(f"⚠️ VLLM returned status {response.status_code}")
     except Exception as e:
-        print(f"⚠️ Could not verify VLLM connection: {e}")
+        logger.warning(f"⚠️ Could not verify VLLM connection: {e}")
     
-    print("✅ TTS API Server ready!")
+    logger.info("✅ TTS API Server ready!")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    print("🛑 Shutting down TTS API Server...")
+    logger.info("🛑 Shutting down TTS API Server...")
 
 
 # API Endpoints
@@ -98,7 +119,8 @@ async def health_check():
     
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{VLLM_URL}/health")
+            health_url = VLLM_BASE_URL.rstrip('/').removesuffix('/v1') + '/health'
+            response = await client.get(health_url)
             vllm_status = "healthy" if response.status_code == 200 else "unhealthy"
     except:
         vllm_status = "unreachable"
@@ -114,10 +136,11 @@ async def health_check():
 @app.get("/v1/voices", response_model=List[VoiceInfo])
 async def list_voices():
     """List available voices"""
-    # Placeholder - will be expanded with full voice catalog
     voices = [
-        VoiceInfo(id="en-US-male", name="English (US) Male", language="en-US", gender="male"),
-        VoiceInfo(id="en-US-female", name="English (US) Female", language="en-US", gender="female"),
+        VoiceInfo(id="English (Male)", name="English (Male)", language="en", gender="male"),
+        VoiceInfo(id="English (Female)", name="English (Female)", language="en", gender="female"),
+        VoiceInfo(id="Hindi (Male)", name="Hindi (Male)", language="hi", gender="male"),
+        VoiceInfo(id="Hindi (Female)", name="Hindi (Female)", language="hi", gender="female"),
     ]
     return voices
 
@@ -125,32 +148,19 @@ async def list_voices():
 @app.post("/v1/text-to-speech")
 async def text_to_speech(request: TTSRequest):
     """
-    Convert text to speech
+    Convert text to speech with streaming
     
     Returns: PCM16 audio data at 24kHz sample rate
     """
-    if snac_codec is None:
-        raise HTTPException(status_code=503, detail="SNAC codec not initialized")
+    if snac_codec is None or vllm_transport is None:
+        raise HTTPException(status_code=503, detail="TTS service not initialized")
     
     try:
-        # Step 1: Format prompt for VLLM
-        prompt = format_tts_prompt(request.text, request.voice)
+        # Create async generator for streaming audio
+        audio_stream = stream_tts_audio(request.text, request.voice)
         
-        # Step 2: Call VLLM to get tokens
-        tokens = await generate_tokens_from_vllm(prompt)
-        
-        # Step 3: Extract audio tokens (filter out text tokens)
-        audio_tokens = extract_audio_tokens(tokens)
-        
-        if not audio_tokens:
-            raise HTTPException(status_code=500, detail="No audio tokens generated")
-        
-        # Step 4: Decode tokens to audio using SNAC
-        audio_bytes = decode_tokens_to_audio(audio_tokens)
-        
-        # Step 5: Return audio
-        return Response(
-            content=audio_bytes,
+        return StreamingResponse(
+            audio_stream,
             media_type="audio/pcm",
             headers={
                 "Content-Type": "audio/pcm",
@@ -163,105 +173,113 @@ async def text_to_speech(request: TTSRequest):
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"TTS generation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
 
 
-# Helper Functions
-def format_tts_prompt(text: str, voice: str) -> str:
+# Core TTS Pipeline
+async def stream_tts_audio(text: str, speaker_id: str) -> AsyncIterator[bytes]:
     """
-    Format text into VLLM prompt
-    Based on Svara-TTS prompt structure
+    Stream audio generation using VLLM + Mapper + SNAC pipeline
+    
+    Flow:
+    1. Format prompt for VLLM
+    2. Stream text chunks from VLLM
+    3. Extract custom token numbers from text
+    4. Feed to mapper to get 28-code windows
+    5. Decode windows to audio with SNAC
+    6. Yield audio bytes
     """
-    # Simplified prompt - will need to be enhanced based on model requirements
-    prompt = f"<|im_start|>system\nYou are a text-to-speech system.<|im_end|>\n"
-    prompt += f"<|im_start|>user\nConvert to speech: {text}<|im_end|>\n"
-    prompt += f"<|im_start|>assistant\n"
+    # Format prompt
+    prompt = format_tts_prompt(text, speaker_id)
+    logger.info(f"📝 Prompt length: {len(prompt)} chars")
+    
+    # Initialize mapper and audio buffer
+    mapper = SvaraMapper()
+    prebuffer_samples = int(SAMPLE_RATE * 0.5)  # 0.5 second prebuffer
+    audio_buf = AudioBuffer(prebuffer_samples)
+    
+    # Use thread pool for concurrent SNAC decoding
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    loop = asyncio.get_running_loop()
+    pending: List[asyncio.Task] = []
+    
+    def decode_window(window: List[int]) -> bytes:
+        """Decode a window using SNAC codec"""
+        return snac_codec.decode_window(window)
+    
+    async def submit_decode(window: List[int]) -> bytes:
+        """Submit decode task to executor"""
+        return await loop.run_in_executor(executor, decode_window, window)
+    
+    try:
+        # Stream tokens from VLLM
+        async for token_text in vllm_transport.astream(prompt):
+            # Extract custom token numbers from text
+            for token_num in extract_custom_token_numbers(token_text):
+                # Feed to mapper
+                window = mapper.feed_raw(token_num)
+                
+                if window is not None:
+                    # Submit decode task
+                    pending.append(asyncio.create_task(submit_decode(window)))
+                    
+                    # Yield when we have enough pending tasks
+                    while len(pending) > 2:
+                        audio_chunk = await pending.pop(0)
+                        result = audio_buf.process(audio_chunk)
+                        if result:
+                            yield result
+        
+        # Flush remaining tasks
+        for task in pending:
+            audio_chunk = await task
+            result = audio_buf.process(audio_chunk)
+            if result:
+                yield result
+        
+        logger.info("✅ Audio generation complete")
+        
+    except Exception as e:
+        logger.error(f"Error in audio streaming: {e}", exc_info=True)
+        raise
+    finally:
+        executor.shutdown(wait=True)
+
+
+def format_tts_prompt(text: str, speaker_id: str) -> str:
+    """
+    Format text into VLLM prompt following Svara-TTS structure
+    
+    Format: <|begin_of_text|>
+            <custom_token_3>
+            <|audio|>
+            {speaker_id}: {text}
+            <custom_token_4>
+            <|eot_id|>
+            <custom_token_5>
+            <custom_token_1>
+    """
+    from tts_engine.constants import (
+        BOS_TOKEN_STR, AUDIO_TOKEN_STR, END_OF_TURN_STR,
+        START_OF_HUMAN_STR, END_OF_HUMAN_STR,
+        START_OF_AI_STR, START_OF_SPEECH_STR
+    )
+    
+    # Build prompt following the exact structure
+    prompt = f"{BOS_TOKEN_STR}"
+    prompt += f"{START_OF_HUMAN_STR}"
+    prompt += f"{AUDIO_TOKEN_STR}"
+    prompt += f" {speaker_id}: {text}"
+    prompt += f"{END_OF_HUMAN_STR}"
+    prompt += f"{END_OF_TURN_STR}"
+    prompt += f"{START_OF_AI_STR}"
+    prompt += f"{START_OF_SPEECH_STR}"
+    
     return prompt
 
 
-async def generate_tokens_from_vllm(prompt: str) -> List[int]:
-    """
-    Call VLLM API to generate tokens
-    """
-    payload = {
-        "model": VLLM_MODEL,
-        "prompt": prompt,
-        "max_tokens": 2048,
-        "temperature": 0.7,
-        "top_p": 0.9,
-    }
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            f"{VLLM_URL}/v1/completions",
-            json=payload
-        )
-        
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"VLLM request failed: {response.text}"
-            )
-        
-        result = response.json()
-        
-        # Extract token IDs from response
-        # Note: This may need adjustment based on actual VLLM response format
-        if "choices" in result and len(result["choices"]) > 0:
-            choice = result["choices"][0]
-            
-            # Try to get token_ids if available
-            if "token_ids" in choice and choice["token_ids"]:
-                return choice["token_ids"]
-            
-            # Otherwise, we'd need to tokenize the text response
-            # For now, raise an error
-            raise HTTPException(
-                status_code=500,
-                detail="VLLM did not return token IDs. Enable logprobs or token_ids in VLLM config."
-            )
-        
-        raise HTTPException(status_code=500, detail="Invalid VLLM response format")
-
-
-def extract_audio_tokens(tokens: List[int]) -> List[int]:
-    """
-    Extract audio tokens from mixed token stream
-    Audio tokens are in range [128266, 156938]
-    """
-    min_audio_token = AUDIO_TOKEN_OFFSETS[0]
-    max_audio_token = AUDIO_TOKEN_OFFSETS[-1] + 4096  # Last offset + vocab size
-    
-    audio_tokens = [
-        token for token in tokens
-        if min_audio_token <= token <= max_audio_token
-    ]
-    
-    return audio_tokens
-
-
-def decode_tokens_to_audio(tokens: List[int]) -> bytes:
-    """
-    Decode audio tokens to PCM16 bytes using SNAC
-    """
-    audio_bytes = b""
-    
-    # SNAC expects tokens in groups of 7 (one frame)
-    # Process in windows of 7 tokens
-    for i in range(0, len(tokens) - 6, 7):
-        window = tokens[i:i+7]
-        if len(window) == 7:
-            try:
-                frame_bytes = snac_codec.decode_window(window)
-                audio_bytes += frame_bytes
-            except Exception as e:
-                print(f"⚠️ Failed to decode window {i//7}: {e}")
-                continue
-    
-    return audio_bytes
-
-
-# Development endpoint for testing
+# Development endpoint
 @app.get("/")
 async def root():
     """Root endpoint"""
