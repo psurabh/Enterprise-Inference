@@ -1,170 +1,227 @@
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: tts-system
-  labels:
-    name: tts-system
-
----
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: tts-api-config
-  namespace: tts-system
+  name: snac-config
+  namespace: default
 data:
-  VLLM_URL: "http://svara-tts-vllm:2080"
-  API_PORT: "8000"
-  LOG_LEVEL: "info"
-  # CPU Optimizations
-  MKL_NUM_THREADS: "8"
-  OMP_NUM_THREADS: "8"
-  TORCH_NUM_THREADS: "8"
+  # SNAC Model configuration
+  SNAC_DEVICE: "cpu"
+  SNAC_MODEL: "hubertsiuzdak/snac_24khz"
+  
+  # PyTorch optimization settings for Intel Xeon
+  OMP_NUM_THREADS: "192"
+  PYTORCH_ENABLE_MPS_FALLBACK: "1"
+  PYTHONUNBUFFERED: "1"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: snac-decoder-service
+  namespace: default
+spec:
+  selector:
+    app: snac-decoder
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
 
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: tts-api
-  namespace: tts-system
+  name: snac-decoder
+  namespace: default
   labels:
-    app: tts-api
-    component: api-server
+    app: snac-decoder
+    version: v1
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
-      app: tts-api
+      app: snac-decoder
   template:
     metadata:
       labels:
-        app: tts-api
-        component: api-server
+        app: snac-decoder
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
     spec:
+      # Node affinity - prefer master1
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - master1
+      
+      # Service account
+      serviceAccountName: snac-decoder
+      
+      # Init containers - prepare environment
+      initContainers:
+        - name: init-snac
+          image: python:3.11-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Installing SNAC dependencies..."
+              pip install -q snac torch torchaudio transformers pydantic fastapi uvicorn aiohttp requests
+              echo "Dependencies installed"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+      
+      # Main containers
       containers:
-      - name: tts-api
-        image: localhost:5000/tts-api:latest
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 8000
-          name: http
-          protocol: TCP
-        env:
-        - name: VLLM_URL
-          valueFrom:
-            configMapKeyRef:
-              name: tts-api-config
-              key: VLLM_URL
-        - name: API_PORT
-          valueFrom:
-            configMapKeyRef:
-              name: tts-api-config
-              key: API_PORT
-        - name: MKL_NUM_THREADS
-          valueFrom:
-            configMapKeyRef:
-              name: tts-api-config
-              key: MKL_NUM_THREADS
-        - name: OMP_NUM_THREADS
-          valueFrom:
-            configMapKeyRef:
-              name: tts-api-config
-              key: OMP_NUM_THREADS
-        - name: TORCH_NUM_THREADS
-          valueFrom:
-            configMapKeyRef:
-              name: tts-api-config
-              key: TORCH_NUM_THREADS
-        resources:
-          requests:
-            memory: "4Gi"
-            cpu: "4"
-          limits:
-            memory: "8Gi"
-            cpu: "8"
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 60
-          periodSeconds: 30
-          timeoutSeconds: 10
-          failureThreshold: 3
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          failureThreshold: 3
-        volumeMounts:
-        - name: cache
-          mountPath: /root/.cache
-        - name: tmp
-          mountPath: /tmp
+        - name: snac-decoder
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          
+          # Command to start the SNAC decoder service
+          command:
+            - /bin/bash
+            - -c
+            - |
+              cd /app
+              pip install -q snac torch torchaudio transformers pydantic fastapi uvicorn aiohttp requests
+              python3 /app/api/server.py
+          
+          # Environment variables from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: snac-config
+          
+          # Additional env vars
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          
+          # Resource requests and limits
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "4000m"
+            limits:
+              memory: "4Gi"
+              cpu: "8000m"
+          
+          # Liveness probe - check every 30s
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          
+          # Readiness probe - check every 10s
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          # Ports
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          
+          # Volume mounts
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+            - name: tmp
+              mountPath: /tmp
+          
+          # Security context
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+            capabilities:
+              drop:
+                - ALL
+      
+      # Volumes
       volumes:
-      - name: cache
-        emptyDir:
-          sizeLimit: 10Gi
-      - name: tmp
-        emptyDir:
-          sizeLimit: 2Gi
+        - name: app-code
+          emptyDir: {}
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+      
+      # Restart policy
+      restartPolicy: Always
+      
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
+      
+      # DNS policy
+      dnsPolicy: ClusterFirst
 
 ---
 apiVersion: v1
-kind: Service
+kind: ServiceAccount
 metadata:
-  name: tts-api
-  namespace: tts-system
-  labels:
-    app: tts-api
-spec:
-  type: ClusterIP
-  selector:
-    app: tts-api
-  ports:
-  - port: 8000
-    targetPort: 8000
-    protocol: TCP
-    name: http
-
----
-# NodePort service for external access (optional)
-apiVersion: v1
-kind: Service
-metadata:
-  name: tts-api-external
-  namespace: tts-system
-  labels:
-    app: tts-api
-spec:
-  type: NodePort
-  selector:
-    app: tts-api
-  ports:
-  - port: 8000
-    targetPort: 8000
-    nodePort: 30800
-    protocol: TCP
-    name: http
-
----
-# Service for VLLM (if not already created)
-apiVersion: v1
-kind: Service
-metadata:
-  name: svara-tts-vllm
+  name: snac-decoder
   namespace: default
-  labels:
-    app: vllm
-spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: vllm
-    app.kubernetes.io/instance: svara-tts-cpu
-  ports:
-  - port: 2080
-    targetPort: 2080
-    protocol: TCP
-    name: http
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: snac-decoder
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: snac-decoder
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: snac-decoder
+subjects:
+  - kind: ServiceAccount
+    name: snac-decoder
+    namespace: default
