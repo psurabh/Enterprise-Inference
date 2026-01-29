@@ -9,7 +9,9 @@ data:
   SNAC_MODEL: "hubertsiuzdak/snac_24khz"
   
   # PyTorch optimization settings for Intel Xeon
-  OMP_NUM_THREADS: "192"
+  # Optimized for 8 cores limit
+  OMP_NUM_THREADS: "8"
+  MKL_NUM_THREADS: "8"
   PYTORCH_ENABLE_MPS_FALLBACK: "1"
   PYTHONUNBUFFERED: "1"
 
@@ -86,7 +88,7 @@ spec:
               echo "Starting installation..."
               # Install CPU-only PyTorch first to avoid downloading NVIDIA/CUDA deps
               pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-              pip install --no-cache-dir snac transformers pydantic fastapi uvicorn aiohttp requests
+              pip install --no-cache-dir snac transformers pydantic fastapi uvicorn aiohttp requests langcodes
               echo "Installation complete. Starting server..."
               export PYTHONPATH=$PYTHONPATH:/app
               python3 /app/api/server.py
@@ -145,7 +147,7 @@ spec:
             - name: engine-code
               mountPath: /app/tts_engine
             - name: assets
-              mountPath: /app/assets
+              mountPath: /app/api/assets
             - name: hf-cache
               mountPath: /root/.cache/huggingface
             - name: tmp
