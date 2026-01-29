@@ -14,6 +14,7 @@ import httpx
 
 from tts_engine.codec import SNACCodec
 from tts_engine.voice_config import get_voice, get_all_voices
+from tts_engine.mapper import SvaraMapper
 
 # Configure logging
 logging.basicConfig(
@@ -153,9 +154,9 @@ async def get_voice_info(voice_id: str):
     )
 
 
-async def generate_tokens_from_vllm(prompt: str, max_tokens: int = 2048) -> list[int]:
+async def generate_text_from_vllm(prompt: str, max_tokens: int = 2048) -> str:
     """
-    Call VLLM to generate audio tokens from text prompt
+    Call VLLM to generate raw text containing tokens from prompt
     """
     try:
         payload = {
@@ -173,10 +174,7 @@ async def generate_tokens_from_vllm(prompt: str, max_tokens: int = 2048) -> list
         result = response.json()
         generated_text = result["choices"][0]["text"]
         
-        # TODO: Parse tokens from generated text
-        # For now, return empty list - needs proper token parsing
-        logger.warning("Token parsing not yet implemented - returning empty list")
-        return []
+        return generated_text
         
     except httpx.HTTPError as e:
         logger.error(f"VLLM request failed: {e}")
@@ -225,26 +223,42 @@ async def text_to_speech(request: TTSRequest):
         # Format prompt for VLLM
         prompt = format_tts_prompt(request.text, voice)
         
-        # Generate tokens from VLLM
-        tokens = await generate_tokens_from_vllm(prompt)
+        # Generate text from VLLM
+        generated_text = await generate_text_from_vllm(prompt)
         
-        if not tokens:
+        if not generated_text:
+             raise HTTPException(
+                status_code=500, 
+                detail="No response text received from VLLM"
+            )
+            
+        logger.info(f"Received text from VLLM: {len(generated_text)} chars")
+        
+        # Parse tokens using SvaraMapper
+        mapper = SvaraMapper()
+        
+        # feed_text returns List[List[int]], where each inner list is a window for the codec
+        token_windows = mapper.feed_text(generated_text)
+        
+        if not token_windows:
             raise HTTPException(
                 status_code=500, 
-                detail="No audio tokens generated - token parsing not yet implemented"
+                detail="No audio tokens found in the generated text"
             )
         
-        # Decode tokens to audio using SNAC
-        # Group tokens into 7-token windows for SNAC decoding
+        logger.info(f"Parsed {len(token_windows)} audio windows")
+        
+        # Decode windows to audio using SNAC
         audio_chunks = []
-        for i in range(0, len(tokens), 7):
-            window = tokens[i:i+7]
-            if len(window) == 7:  # Only decode complete windows
-                audio_bytes = snac_codec.decode_window(window)
+        for window in token_windows:
+             # window is already a list of 28 SNAC codes (4 frames x 7 codes)
+             # passed directly to decode_window which handles it
+            audio_bytes = snac_codec.decode_window(window)
+            if audio_bytes:
                 audio_chunks.append(audio_bytes)
         
         if not audio_chunks:
-            raise HTTPException(status_code=500, detail="Failed to decode audio")
+            raise HTTPException(status_code=500, detail="Failed to decode audio tokens")
         
         # Combine all audio chunks
         full_audio = b''.join(audio_chunks)
