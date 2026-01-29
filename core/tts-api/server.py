@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 import httpx
 
 from tts_engine.codec import SNACCodec
-from tts_engine.voice_config import get_voice, get_all_voices
+from tts_engine.voice_config import get_voice, get_all_voices, get_speaker_id
 from tts_engine.mapper import SvaraMapper
 from tts_engine.constants import (
     BOS_TOKEN_STR,
@@ -199,7 +199,11 @@ def format_tts_prompt(text: str, voice: Any) -> str:
     Format text into VLLM prompt following Svara-TTS format
     """
     # Construct speaker ID (e.g., "Hindi (Male)")
-    speaker_id = voice.name
+    try:
+        speaker_id = get_speaker_id(voice.voice_id)
+    except Exception as e:
+        logger.warning(f"Could not get speaker ID for {voice.voice_id}, falling back to name: {e}")
+        speaker_id = voice.name
     
     # Construct prompt using the specific token sequence expected by the model
     # Format: BOS + <human_turn> + <ai_start>
