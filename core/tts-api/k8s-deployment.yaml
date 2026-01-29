@@ -71,25 +71,6 @@ spec:
       # Service account
       serviceAccountName: snac-decoder
       
-      # Init containers - prepare environment
-      initContainers:
-        - name: init-snac
-          image: python:3.11-slim
-          command:
-            - /bin/sh
-            - -c
-            - |
-              echo "Installing SNAC dependencies..."
-              pip install -q snac torch torchaudio transformers pydantic fastapi uvicorn aiohttp requests
-              echo "Dependencies installed"
-          resources:
-            requests:
-              memory: "512Mi"
-              cpu: "500m"
-            limits:
-              memory: "1Gi"
-              cpu: "1000m"
-      
       # Main containers
       containers:
         - name: snac-decoder
@@ -102,7 +83,12 @@ spec:
             - -c
             - |
               cd /app
-              pip install -q snac torch torchaudio transformers pydantic fastapi uvicorn aiohttp requests
+              echo "Starting installation..."
+              # Install CPU-only PyTorch first to avoid downloading NVIDIA/CUDA deps
+              pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+              pip install --no-cache-dir snac transformers pydantic fastapi uvicorn aiohttp requests
+              echo "Installation complete. Starting server..."
+              export PYTHONPATH=$PYTHONPATH:/app
               python3 /app/api/server.py
           
           # Environment variables from ConfigMap
@@ -120,10 +106,10 @@ spec:
           # Resource requests and limits
           resources:
             requests:
-              memory: "2Gi"
+              memory: "4Gi"
               cpu: "4000m"
             limits:
-              memory: "4Gi"
+              memory: "8Gi"
               cpu: "8000m"
           
           # Liveness probe - check every 30s
@@ -131,7 +117,7 @@ spec:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 60
+            initialDelaySeconds: 300
             periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 3
@@ -141,7 +127,7 @@ spec:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 30
+            initialDelaySeconds: 300
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
@@ -154,8 +140,12 @@ spec:
           
           # Volume mounts
           volumeMounts:
-            - name: app-code
-              mountPath: /app
+            - name: api-code
+              mountPath: /app/api
+            - name: engine-code
+              mountPath: /app/tts_engine
+            - name: assets
+              mountPath: /app/assets
             - name: hf-cache
               mountPath: /root/.cache/huggingface
             - name: tmp
@@ -172,14 +162,24 @@ spec:
       
       # Volumes
       volumes:
-        - name: app-code
-          emptyDir: {}
+        - name: api-code
+          hostPath:
+            path: /home/ubuntu/EI_Stack/Enterprise-Inference/core/tts-api
+            type: Directory
+        - name: engine-code
+          hostPath:
+            path: /home/ubuntu/EI_Stack/Enterprise-Inference/core/tts_engine
+            type: Directory
+        - name: assets
+          hostPath:
+            path: /home/ubuntu/EI_Stack/Enterprise-Inference/core/assets
+            type: Directory
         - name: hf-cache
           emptyDir:
             sizeLimit: 10Gi
         - name: tmp
           emptyDir:
-            sizeLimit: 2Gi
+            sizeLimit: 4Gi
       
       # Restart policy
       restartPolicy: Always

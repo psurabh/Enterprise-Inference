@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 import httpx
 
 from tts_engine.codec import SNACCodec
-from tts_engine.voice_config import VoiceConfig, get_voice_by_id, list_all_voices
+from tts_engine.voice_config import get_voice, get_all_voices
 
 # Configure logging
 logging.basicConfig(
@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 # Global instances
 snac_codec: Optional[SNACCodec] = None
-voice_config: Optional[VoiceConfig] = None
 vllm_client: Optional[httpx.AsyncClient] = None
 
 # Configuration
@@ -35,7 +34,7 @@ VLLM_MODEL = "kenpath/svara-tts-v1"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    global snac_codec, voice_config, vllm_client
+    global snac_codec, vllm_client
     
     # Startup
     logger.info("Initializing Svara TTS API server...")
@@ -47,8 +46,8 @@ async def lifespan(app: FastAPI):
     
     # Initialize voice configuration
     logger.info("Loading voice configuration...")
-    voice_config = VoiceConfig()
-    logger.info(f"Loaded {len(voice_config.voices)} voices")
+    voices = get_all_voices()
+    logger.info(f"Loaded {len(voices)} voices")
     
     # Initialize VLLM HTTP client
     vllm_client = httpx.AsyncClient(
@@ -117,43 +116,40 @@ async def health_check():
         status="healthy" if (snac_codec and vllm_ok) else "degraded",
         snac_loaded=snac_codec is not None,
         vllm_connected=vllm_ok,
-        voices_loaded=len(voice_config.voices) if voice_config else 0
+        voices_loaded=len(get_all_voices())
     )
 
 
 @app.get("/v1/voices", response_model=list[VoiceInfo])
 async def get_voices():
     """List all available voices"""
-    if not voice_config:
-        raise HTTPException(status_code=503, detail="Voice configuration not loaded")
-    
     return [
         VoiceInfo(
-            id=voice.id,
+            id=voice.voice_id,
             name=voice.name,
-            language=voice.language,
-            language_code=voice.language_code,
-            gender=voice.gender,
-            description=voice.description
+            language=voice.languages[0] if voice.languages else "en",
+            language_code=voice.languages[0] if voice.languages else "en",
+            gender=voice.gender or "unknown",
+            description=voice.description or ""
         )
-        for voice in list_all_voices()
+        for voice in get_all_voices()
     ]
 
 
 @app.get("/v1/voices/{voice_id}", response_model=VoiceInfo)
 async def get_voice_info(voice_id: str):
     """Get information about a specific voice"""
-    voice = get_voice_by_id(voice_id)
+    voice = get_voice(voice_id)
     if not voice:
         raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
     
     return VoiceInfo(
-        id=voice.id,
+        id=voice.voice_id,
         name=voice.name,
-        language=voice.language,
-        language_code=voice.language_code,
-        gender=voice.gender,
-        description=voice.description
+        language=voice.languages[0] if voice.languages else "en",
+        language_code=voice.languages[0] if voice.languages else "en",
+        gender=voice.gender or "unknown",
+        description=voice.description or ""
     )
 
 
@@ -194,11 +190,12 @@ def format_tts_prompt(text: str, voice: Any) -> str:
     """
     Format text into VLLM prompt following Svara-TTS format
     """
+    lang = voice.languages[0] if voice.languages else "en"
     # Based on official repo's prompt format
     prompt = f"""<|im_start|>system
 You are a text-to-speech system. Generate natural speech for the given text.<|im_end|>
 <|im_start|>user
-Voice: {voice.name} ({voice.language})
+Voice: {voice.name} ({lang})
 Text: {text}<|im_end|>
 <|im_start|>assistant
 <|audio|>"""
@@ -214,7 +211,7 @@ async def text_to_speech(request: TTSRequest):
     Returns streaming audio in the requested format
     """
     # Validate voice
-    voice = get_voice_by_id(request.voice_id)
+    voice = get_voice(request.voice_id)
     if not voice:
         raise HTTPException(status_code=404, detail=f"Voice '{request.voice_id}' not found")
     
