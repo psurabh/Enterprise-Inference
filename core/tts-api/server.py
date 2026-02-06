@@ -39,7 +39,7 @@ snac_codec: Optional[SNACCodec] = None
 vllm_client: Optional[httpx.AsyncClient] = None
 
 # Configuration
-VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://10.233.33.65:2080")  # K8s service IP
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:2080")
 VLLM_MODEL = os.getenv("VLLM_MODEL", "kenpath/svara-tts-v1")
 
 
