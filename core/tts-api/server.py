@@ -4,6 +4,7 @@ Integrates VLLM token generation with SNAC audio decoding
 """
 import logging
 import asyncio
+import os
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -38,8 +39,8 @@ snac_codec: Optional[SNACCodec] = None
 vllm_client: Optional[httpx.AsyncClient] = None
 
 # Configuration
-VLLM_BASE_URL = "http://10.233.104.79:2080"  # K8s pod IP
-VLLM_MODEL = "kenpath/svara-tts-v1"
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://10.233.33.65:2080")  # K8s service IP
+VLLM_MODEL = os.getenv("VLLM_MODEL", "kenpath/svara-tts-v1")
 
 
 @asynccontextmanager
@@ -63,7 +64,7 @@ async def lifespan(app: FastAPI):
     # Initialize VLLM HTTP client
     vllm_client = httpx.AsyncClient(
         base_url=VLLM_BASE_URL,
-        timeout=httpx.Timeout(60.0)
+        timeout=httpx.Timeout(300.0)
     )
     logger.info(f"Connected to VLLM at {VLLM_BASE_URL}")
     

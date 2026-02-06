@@ -184,7 +184,7 @@ max_num_batched_tokens: "2048"
 max_num_seqs: "256"
 
 # Parallelism configuration (root level for global access)
-tensor_parallel_size: "2"
+tensor_parallel_size: "1"
 pipeline_parallel_size: "1"
 
 svcmonitor:

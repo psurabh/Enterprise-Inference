@@ -4,6 +4,9 @@ metadata:
   name: snac-config
   namespace: default
 data:
+  # VLLM Configuration
+  VLLM_BASE_URL: "http://svara-cpu-vllm-service:80"
+
   # SNAC Model configuration
   SNAC_DEVICE: "cpu"
   SNAC_MODEL: "hubertsiuzdak/snac_24khz"
@@ -166,15 +169,15 @@ spec:
       volumes:
         - name: api-code
           hostPath:
-            path: /home/ubuntu/EI_Stack/Enterprise-Inference/core/tts-api
+            path: /home/ubuntu/Enterprise-Inference/core/tts-api
             type: Directory
         - name: engine-code
           hostPath:
-            path: /home/ubuntu/EI_Stack/Enterprise-Inference/core/tts_engine
+            path: /home/ubuntu/Enterprise-Inference/core/tts_engine
             type: Directory
         - name: assets
           hostPath:
-            path: /home/ubuntu/EI_Stack/Enterprise-Inference/core/assets
+            path: /home/ubuntu/Enterprise-Inference/core/assets
             type: Directory
         - name: hf-cache
           emptyDir:
