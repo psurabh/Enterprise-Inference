@@ -169,15 +169,15 @@ spec:
       volumes:
         - name: api-code
           hostPath:
-            path: /home/ubuntu/Enterprise-Inference/core/tts-api
+            path: /home/ubuntu/Enterprise-Inference/core/TTS/api
             type: Directory
         - name: engine-code
           hostPath:
-            path: /home/ubuntu/Enterprise-Inference/core/tts_engine
+            path: /home/ubuntu/Enterprise-Inference/core/TTS/engine
             type: Directory
         - name: assets
           hostPath:
-            path: /home/ubuntu/Enterprise-Inference/core/assets
+            path: /home/ubuntu/Enterprise-Inference/core/TTS/assets
             type: Directory
         - name: hf-cache
           emptyDir:
