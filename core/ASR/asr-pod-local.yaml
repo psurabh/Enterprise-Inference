@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wav2vec2-asr-pod
+  namespace: default
+  labels:
+    app: wav2vec2-asr
+    version: v1
+spec:
+  containers:
+  - name: asr-container
+    image: python:3.10-slim
+    imagePullPolicy: IfNotPresent
+    
+    # Resource requests and limits
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "1"
+      limits:
+        memory: "4Gi"
+        cpu: "2"
+    
+    # Environment variables
+    env:
+    - name: DEFAULT_SAMPLING_RATE
+      value: "16000"
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    
+    # Run the pod service
+    command: ["/bin/bash"]
+    args:
+      - -c
+      - |
+        set -e
+        echo "Installing system dependencies..."
+        apt-get update && apt-get install -y sox libsox-fmt-all libsox-dev g++
+        
+        echo "Installing Python dependencies..."
+        pip install --no-cache-dir -q \
+          torch==2.1.0 \
+          torchaudio==2.1.0 \
+          numpy==1.26.4 \
+          fairseq==0.12.2 \
+          librosa \
+          soundfile
+        
+        echo "Starting ASR Pod Service..."
+        python /app/pod_service.py
+    
+    # Volume mounts
+    volumeMounts:
+    - name: app-code
+      mountPath: /app
+    - name: audio-input
+      mountPath: /app/input
+    - name: transcription-output
+      mountPath: /app/output
+  
+  # Volumes - mount local directories
+  volumes:
+  - name: app-code
+    hostPath:
+      path: /home/ubuntu/ASR/ASR/Wav2Vec2
+      type: Directory
+  - name: audio-input
+    hostPath:
+      path: /home/ubuntu/ASR/ASR/Wav2Vec2/pod_input
+      type: DirectoryOrCreate
+  - name: transcription-output
+    hostPath:
+      path: /home/ubuntu/ASR/ASR/Wav2Vec2/pod_output
+      type: DirectoryOrCreate
+  
+  # Pod restart policy
+  restartPolicy: OnFailure
+  
+  # Node selector (specify master node)
+  nodeSelector:
+    kubernetes.io/hostname: master1

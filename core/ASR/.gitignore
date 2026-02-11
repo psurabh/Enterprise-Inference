@@ -1,0 +1,9 @@
+hindi.pt
+__pycache__/
+.venv/
+input/
+output/
+pod_input/
+pod_output/
+omegaconf_temp/
+*.pyc
