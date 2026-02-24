@@ -31,7 +31,8 @@ spec:
     - name: http
       port: 8000
       targetPort: 8000
-  type: ClusterIP
+      nodePort: 30800
+  type: NodePort
 
 ---
 apiVersion: apps/v1
@@ -169,15 +170,15 @@ spec:
       volumes:
         - name: api-code
           hostPath:
-            path: /home/ubuntu/Enterprise-Inference/core/TTS/api
+            path: /home/ubuntu/Enterprise-Inference/core/TTS/kenpath_svara/api
             type: Directory
         - name: engine-code
           hostPath:
-            path: /home/ubuntu/Enterprise-Inference/core/TTS/engine
+            path: /home/ubuntu/Enterprise-Inference/core/TTS/kenpath_svara/engine
             type: Directory
         - name: assets
           hostPath:
-            path: /home/ubuntu/Enterprise-Inference/core/TTS/assets
+            path: /home/ubuntu/Enterprise-Inference/core/TTS/kenpath_svara/assets
             type: Directory
         - name: hf-cache
           emptyDir:
