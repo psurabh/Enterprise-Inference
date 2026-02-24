@@ -26,7 +26,7 @@ pip install -r requirements.txt
 ## Configuration
 
 Environment variables:
-- `VLLM_URL`: VLLM endpoint (default: `http://10.233.104.79:2080`)
+- `VLLM_URL`: VLLM endpoint (default: `http://35.94.217.247:2080`)
 - `API_PORT`: API server port (default: `8000`)
 
 ## Running

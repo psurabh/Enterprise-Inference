@@ -45,7 +45,7 @@ data:
     from tts_engine.constants import SAMPLE_RATE, BIT_DEPTH, AUDIO_TOKEN_OFFSETS
     
     # Configuration
-    VLLM_URL = os.getenv("VLLM_URL", "http://10.233.104.79:2080")
+    VLLM_URL = os.getenv("VLLM_URL", "http://35.94.217.247:2080")
     VLLM_MODEL = "kenpath/svara-tts-v1"
     API_PORT = int(os.getenv("API_PORT", "8000"))
     

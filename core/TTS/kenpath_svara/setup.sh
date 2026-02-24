@@ -20,13 +20,24 @@
 set -euo pipefail
 
 # --------------------------------------------------------------------------
-# Colour helpers
+# Logging setup — everything goes to terminal AND a timestamped log file
+# --------------------------------------------------------------------------
+LOG_DIR="/tmp/svara-tts-setup"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/setup-$(date +%Y%m%d-%H%M%S).log"
+# Tee all stdout+stderr to the log file
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Setup log started — writing to $LOG_FILE"
+
+# --------------------------------------------------------------------------
+# Colour helpers (colours in terminal; plain text lands in log file via tee)
 # --------------------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
-success() { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+ts()      { date '+%Y-%m-%d %H:%M:%S'; }
+info()    { echo -e "[$(ts)] ${CYAN}[INFO]${NC}  $*"; }
+success() { echo -e "[$(ts)] ${GREEN}[OK]${NC}    $*"; }
+warn()    { echo -e "[$(ts)] ${YELLOW}[WARN]${NC}  $*"; }
+error()   { echo -e "[$(ts)] ${RED}[ERROR]${NC} $*"; exit 1; }
 
 # --------------------------------------------------------------------------
 # Configuration — edit here if needed
@@ -103,27 +114,12 @@ else
 fi
 
 # --------------------------------------------------------------------------
-# Step 3: HuggingFace token secret
+# Step 3: HuggingFace token secret (skipped)
 # --------------------------------------------------------------------------
-info "Checking HuggingFace token secret '$HF_SECRET_NAME'..."
-if kubectl get secret "$HF_SECRET_NAME" -n "$NAMESPACE" &>/dev/null; then
-    success "Secret '$HF_SECRET_NAME' already exists — skipping"
-else
-    # Prompt for token
-    echo ""
-    echo -e "${YELLOW}  The model 'kenpath/svara-tts-v1' requires a HuggingFace access token.${NC}"
-    echo -e "${YELLOW}  Get one at: https://huggingface.co/settings/tokens${NC}"
-    echo ""
-    read -rsp "  Enter HuggingFace token (input hidden): " HF_TOKEN
-    echo ""
-    if [[ -z "$HF_TOKEN" ]]; then
-        error "HuggingFace token cannot be empty."
-    fi
-    kubectl create secret generic "$HF_SECRET_NAME" \
-        --from-literal=HF_TOKEN="$HF_TOKEN" \
-        -n "$NAMESPACE"
-    success "Secret '$HF_SECRET_NAME' created"
-fi
+info "Skipping HuggingFace token secret step."
+# To enable, create the secret manually:
+#   kubectl create secret generic svara-cpu-vllm-secret \
+#       --from-literal=HF_TOKEN=<your_token> -n default
 
 # --------------------------------------------------------------------------
 # Step 4: PVC for VLLM model storage
@@ -229,4 +225,6 @@ echo "  │       --output speech.wav"
 echo "  └─────────────────────────────────────────────────────"
 echo ""
 echo -e "${GREEN}  Done!${NC} To monitor pods:  kubectl get pods -n $NAMESPACE -w"
+echo ""
+echo -e "${CYAN}  Full log saved to:${NC} $LOG_FILE"
 echo ""

@@ -5,7 +5,8 @@ Integrates VLLM token generation with SNAC audio decoding
 import logging
 import asyncio
 import os
-from typing import Optional, Dict, Any
+import time
+from typing import Any, Dict, Literal, Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Response
@@ -42,6 +43,19 @@ vllm_client: Optional[httpx.AsyncClient] = None
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:2080")
 VLLM_MODEL = os.getenv("VLLM_MODEL", "kenpath/svara-tts-v1")
 
+# ---------------------------------------------------------------------------
+# OpenAI voice alias → Svara voice ID mapping
+# Allows drop-in replacement for clients built against the OpenAI TTS API.
+# ---------------------------------------------------------------------------
+OPENAI_VOICE_MAP: Dict[str, str] = {
+    "alloy":   "en_male",
+    "echo":    "en_male",
+    "fable":   "en_female",
+    "onyx":    "hi_male",
+    "nova":    "en_female",
+    "shimmer": "hi_female",
+}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -64,7 +78,7 @@ async def lifespan(app: FastAPI):
     # Initialize VLLM HTTP client
     vllm_client = httpx.AsyncClient(
         base_url=VLLM_BASE_URL,
-        timeout=httpx.Timeout(300.0)
+        timeout=httpx.Timeout(600.0)
     )
     logger.info(f"Connected to VLLM at {VLLM_BASE_URL}")
     
@@ -81,9 +95,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Svara TTS API",
-    description="Text-to-Speech API using VLLM + SNAC",
+    description=(
+        "OpenAI-compatible Text-to-Speech API powered by VLLM + SNAC.\n\n"
+        "Drop-in replacement for `POST /v1/audio/speech` and `GET /v1/models`.\n"
+        "Native Svara endpoints (`/v1/voices`, `/v1/text-to-speech`) are also available."
+    ),
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    openapi_tags=[
+        {"name": "Audio",   "description": "OpenAI-compatible speech synthesis"},
+        {"name": "Models",  "description": "Available TTS models"},
+        {"name": "Voices",  "description": "Svara native voice management"},
+        {"name": "System",  "description": "Health and service metadata"},
+    ],
 )
 
 
@@ -111,8 +135,38 @@ class HealthResponse(BaseModel):
     voices_loaded: int
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible models
+# Reference: https://platform.openai.com/docs/api-reference/audio/createSpeech
+# ---------------------------------------------------------------------------
+
+OPENAI_VOICES = Literal["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+OPENAI_FORMATS = Literal["wav", "mp3", "opus", "aac", "flac", "pcm"]
+OPENAI_MODELS = Literal["tts-1", "tts-1-hd"]
+
+
+class OpenAITTSRequest(BaseModel):
+    model: OPENAI_MODELS = Field(default="tts-1", description="TTS model ID")
+    input: str = Field(..., min_length=1, max_length=4096, description="Text to synthesize")
+    voice: OPENAI_VOICES = Field(default="alloy", description="OpenAI voice alias")
+    response_format: OPENAI_FORMATS = Field(default="wav", description="Output audio format")
+    speed: float = Field(default=1.0, ge=0.25, le=4.0, description="Speech speed multiplier")
+
+
+class OpenAIModelCard(BaseModel):
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str
+
+
+class OpenAIModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[OpenAIModelCard]
+
+
 # Endpoints
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
     """Health check endpoint"""
     vllm_ok = False
@@ -132,7 +186,7 @@ async def health_check():
     )
 
 
-@app.get("/v1/voices", response_model=list[VoiceInfo])
+@app.get("/v1/voices", response_model=list[VoiceInfo], tags=["Voices"])
 async def get_voices():
     """List all available voices"""
     return [
@@ -148,7 +202,7 @@ async def get_voices():
     ]
 
 
-@app.get("/v1/voices/{voice_id}", response_model=VoiceInfo)
+@app.get("/v1/voices/{voice_id}", response_model=VoiceInfo, tags=["Voices"])
 async def get_voice_info(voice_id: str):
     """Get information about a specific voice"""
     voice = get_voice(voice_id)
@@ -222,95 +276,192 @@ def format_tts_prompt(text: str, voice: Any) -> str:
     return prompt
 
 
-@app.post("/v1/text-to-speech")
-async def text_to_speech(request: TTSRequest):
+async def _synthesize(text: str, voice_id: str, fmt: str, speed: float) -> Response:
     """
-    Convert text to speech audio
-    
-    Returns streaming audio in the requested format
+    Shared synthesis coroutine used by both the native and OpenAI-compatible endpoints.
+
+    Args:
+        text:     Input text to synthesize.
+        voice_id: Svara voice ID (e.g. "en_male", "hi_female").
+        fmt:      Output format — "wav" or "pcm".  Other formats return 501.
+        speed:    Speed multiplier (reserved; pipeline does not alter pitch/speed yet).
+
+    Returns:
+        FastAPI ``Response`` containing the encoded audio bytes.
+
+    Raises:
+        HTTPException 404  – voice not found
+        HTTPException 501  – unsupported audio format
+        HTTPException 502  – upstream VLLM error
+        HTTPException 503  – SNAC codec not initialised
+        HTTPException 500  – unexpected synthesis failure
     """
-    # Validate voice
-    voice = get_voice(request.voice_id)
+    voice = get_voice(voice_id)
     if not voice:
-        raise HTTPException(status_code=404, detail=f"Voice '{request.voice_id}' not found")
-    
-    # Check codec availability
+        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+
     if not snac_codec:
         raise HTTPException(status_code=503, detail="SNAC codec not available")
-    
-    logger.info(f"TTS request: text='{request.text[:50]}...', voice={request.voice_id}")
-    
+
+    if fmt not in ("wav", "pcm"):
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"Audio format '{fmt}' is not yet supported. "
+                "Supported formats: wav, pcm."
+            ),
+        )
+
+    logger.info("Synthesis request | voice=%s format=%s text_len=%d", voice_id, fmt, len(text))
+
     try:
-        # Format prompt for VLLM
-        prompt = format_tts_prompt(request.text, voice)
-        
-        # Generate text from VLLM
+        prompt = format_tts_prompt(text, voice)
         generated_text = await generate_text_from_vllm(prompt)
-        
+
         if not generated_text:
-             raise HTTPException(
-                status_code=500, 
-                detail="No response text received from VLLM"
+            raise HTTPException(
+                status_code=500,
+                detail="VLLM returned an empty response",
             )
-            
-        logger.info(f"Received text from VLLM: {len(generated_text)} chars")
-        
-        # Parse tokens using SvaraMapper
+
+        logger.info("VLLM response received | chars=%d", len(generated_text))
+
         mapper = SvaraMapper()
-        
-        # feed_text returns List[List[int]], where each inner list is a window for the codec
         token_windows = mapper.feed_text(generated_text)
-        
+
         if not token_windows:
             raise HTTPException(
-                status_code=500, 
-                detail="No audio tokens found in the generated text"
+                status_code=500,
+                detail="No audio tokens found in the generated output",
             )
-        
-        logger.info(f"Parsed {len(token_windows)} audio windows")
-        
-        # Decode windows to audio using SNAC
-        audio_chunks = []
+
+        logger.info("Audio token windows parsed | windows=%d", len(token_windows))
+
+        audio_chunks: list[bytes] = []
         for window in token_windows:
-             # window is already a list of 28 SNAC codes (4 frames x 7 codes)
-             # passed directly to decode_window which handles it
             audio_bytes = snac_codec.decode_window(window)
             if audio_bytes:
                 audio_chunks.append(audio_bytes)
-        
+
         if not audio_chunks:
-            raise HTTPException(status_code=500, detail="Failed to decode audio tokens")
-        
-        # Combine all audio chunks
-        full_audio = b''.join(audio_chunks)
-        
-        # Return appropriate format
-        if request.format == "wav":
-            # Add WAV header
-            wav_data = create_wav_header(len(full_audio)) + full_audio
-            return Response(
-                content=wav_data,
-                media_type="audio/wav",
-                headers={
-                    "Content-Disposition": "attachment; filename=speech.wav"
-                }
-            )
-        elif request.format == "pcm":
-            return Response(
-                content=full_audio,
-                media_type="audio/pcm",
-                headers={
-                    "Content-Disposition": "attachment; filename=speech.pcm"
-                }
-            )
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported format: {request.format}")
-        
+            raise HTTPException(status_code=500, detail="SNAC decode produced no audio output")
+
+        pcm_audio = b"".join(audio_chunks)
+
+        if fmt == "wav":
+            audio_data = create_wav_header(len(pcm_audio)) + pcm_audio
+            media_type = "audio/wav"
+            filename = "speech.wav"
+        else:  # pcm
+            audio_data = pcm_audio
+            media_type = "audio/pcm"
+            filename = "speech.pcm"
+
+        return Response(
+            content=audio_data,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"TTS generation failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error("Synthesis pipeline failure | voice=%s error=%s", voice_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Native Svara endpoint  (backwards-compatible)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/v1/text-to-speech",
+    tags=["Audio"],
+    summary="Synthesize speech (Svara native)",
+    response_description="Audio file in the requested format",
+)
+async def text_to_speech(request: TTSRequest):
+    """
+    Convert text to speech using a Svara native voice ID.
+
+    Kept for backwards compatibility. New integrations should prefer
+    the OpenAI-compatible ``POST /v1/audio/speech`` endpoint.
+    """
+    return await _synthesize(
+        text=request.text,
+        voice_id=request.voice_id,
+        fmt=request.format,
+        speed=request.speed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible endpoint
+# Reference: https://platform.openai.com/docs/api-reference/audio/createSpeech
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/v1/audio/speech",
+    tags=["Audio"],
+    summary="Synthesize speech (OpenAI-compatible)",
+    response_description="Audio file in the requested format",
+    responses={
+        200: {"content": {"audio/wav": {}, "audio/pcm": {}}, "description": "Synthesized audio"},
+        404: {"description": "Voice not found"},
+        501: {"description": "Audio format not supported"},
+        502: {"description": "VLLM upstream error"},
+        503: {"description": "SNAC codec not available"},
+    },
+)
+async def openai_text_to_speech(request: OpenAITTSRequest):
+    """
+    OpenAI-compatible speech synthesis endpoint.
+
+    Accepts the same request body as the OpenAI ``POST /v1/audio/speech`` API,
+    mapping OpenAI voice aliases to the corresponding Svara voices:
+
+    | OpenAI voice | Svara voice  |
+    |--------------|--------------|
+    | alloy        | en\_male     |
+    | echo         | en\_male     |
+    | fable        | en\_female   |
+    | onyx         | hi\_male     |
+    | nova         | en\_female   |
+    | shimmer      | hi\_female   |
+    """
+    svara_voice_id = OPENAI_VOICE_MAP[request.voice]
+    logger.info(
+        "OpenAI TTS request | model=%s openai_voice=%s svara_voice=%s",
+        request.model, request.voice, svara_voice_id,
+    )
+    return await _synthesize(
+        text=request.input,
+        voice_id=svara_voice_id,
+        fmt=request.response_format,
+        speed=request.speed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible models listing
+# Reference: https://platform.openai.com/docs/api-reference/models/list
+# ---------------------------------------------------------------------------
+
+_SVARA_MODELS: list[OpenAIModelCard] = [
+    OpenAIModelCard(id="tts-1",    created=1677610602, owned_by="svara"),
+    OpenAIModelCard(id="tts-1-hd", created=1677610602, owned_by="svara"),
+]
+
+
+@app.get(
+    "/v1/models",
+    response_model=OpenAIModelList,
+    tags=["Models"],
+    summary="List available TTS models",
+)
+async def list_models() -> OpenAIModelList:
+    """Return the list of available TTS models in OpenAI format."""
+    return OpenAIModelList(data=_SVARA_MODELS)
 
 
 def create_wav_header(data_size: int, sample_rate: int = 24000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -339,18 +490,25 @@ def create_wav_header(data_size: int, sample_rate: int = 24000, channels: int = 
     return header
 
 
-@app.get("/")
+@app.get("/", tags=["System"])
 async def root():
-    """Root endpoint with API information"""
+    """Service discovery — returns endpoint map and compatibility information."""
     return {
         "service": "Svara TTS API",
         "version": "1.0.0",
+        "openai_compatible": True,
         "endpoints": {
-            "health": "/health",
-            "voices": "/v1/voices",
-            "tts": "/v1/text-to-speech"
+            # OpenAI-compatible
+            "speech":          "POST /v1/audio/speech",
+            "models":          "GET  /v1/models",
+            # Svara native
+            "voices":          "GET  /v1/voices",
+            "voice_detail":    "GET  /v1/voices/{voice_id}",
+            "tts_native":      "POST /v1/text-to-speech",
+            # System
+            "health":          "GET  /health",
+            "documentation":   "GET  /docs",
         },
-        "documentation": "/docs"
     }
 
 
